@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Tank Strike: Fixed Edition</title>
+    <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
+    <style>
+        body { margin: 0; background: #000; color: white; font-family: sans-serif; overflow: hidden; touch-action: none; }
+        #menu, #game-over { 
+            position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); 
+            background: #111; padding: 25px; border-radius: 15px; 
+            text-align: center; z-index: 30; border: 3px solid #2ecc71; width: 280px;
+        }
+        #game-over { display: none; border-color: #f1c40f; }
+        canvas { display: block; background: #1a1a1a; margin: auto; }
+        .controls { display: flex; flex-direction: column; gap: 10px; }
+        input { padding: 12px; border-radius: 8px; border: 1px solid #444; background: #222; color: white; text-align: center; font-size: 20px; font-weight: bold; }
+        button { padding: 12px; cursor: pointer; background: #2ecc71; border: none; color: white; font-weight: bold; border-radius: 8px; font-size: 14px; }
+        #host-id-display { margin: 10px 0; color: #f1c40f; font-size: 35px; font-weight: bold; letter-spacing: 3px; }
+        .joystick-container { position: absolute; bottom: 10%; width: 110px; height: 110px; background: rgba(255,255,255,0.1); border-radius: 50%; display: none; z-index: 10; border: 1px solid rgba(255,255,255,0.2); }
+        #move-stick { left: 40px; }
+        #fire-stick { right: 40px; }
+        .stick { position: absolute; width: 45px; height: 45px; background: rgba(255,255,255,0.4); border-radius: 50%; top: 32.5px; left: 32.5px; }
+        #conn-stat { position: absolute; top: 10px; left: 10px; font-size: 10px; color: #555; }
+        #leave-btn { position: absolute; top: 10px; right: 10px; background: #c0392b; padding: 8px 15px; display: none; border: none; border-radius: 5px; color: white; z-index: 40; }
+    </style>
+</head>
+<body>
+
+<div id="conn-stat">OFFLINE</div>
+<button id="leave-btn" onclick="location.reload()">LEAVE</button>
+
+<div id="menu">
+    <h2 style="margin:0 0 10px 0;">TANK STRIKE</h2>
+    <div class="controls">
+        <button onclick="startHost()">HOST GAME</button>
+        <div id="host-id-display">----</div>
+        <input type="number" id="join-id" placeholder="CODE">
+        <button style="background:#3498db" onclick="startJoin()">JOIN ROOM</button>
+    </div>
+</div>
+
+<div id="game-over">
+    <h1 id="result-text">WASTED</h1>
+    <button id="restart-btn" style="background:#f39c12; width:100%; display:none;" onclick="hostRequestReset()">PLAY AGAIN</button>
+    <p id="wait-msg" style="font-size:12px; color:#888;">Waiting for Host...</p>
+</div>
+
+<div id="move-stick" class="joystick-container"><div class="stick"></div></div>
+<div id="fire-stick" class="joystick-container"><div class="stick"></div></div>
+<canvas id="gameCanvas"></canvas>
+
+<script>
+    const canvas = document.getElementById('gameCanvas');
+    const ctx = canvas.getContext('2d');
+    const GAME_W = 1200, GAME_H = 700;
+    let scale = 1, obstacles = [], peer, conn, isHost = false, gameRunning = false, lastFire = 0;
+
+    function resize() {
+        scale = Math.min(window.innerWidth / GAME_W, window.innerHeight / GAME_H);
+        canvas.width = GAME_W * scale; canvas.height = GAME_H * scale;
+        ctx.setTransform(scale, 0, 0, scale, 0, 0);
+    }
+    window.addEventListener('resize', resize); resize();
+
+    let players = {
+        p1: { x: 150, y: 350, angle: 0, color: '#e74c3c', bullets: [], hp: 10 },
+        p2: { x: 1050, y: 350, angle: Math.PI, color: '#3498db', bullets: [], hp: 10 }
+    };
+
+    // Initialize Peer
+    function initPeer(id) {
+        peer = new Peer(id);
+        peer.on('open', (id) => { document.getElementById('conn-stat').innerText = "PEER ID: " + id; });
+        peer.on('error', () => initPeer(Math.floor(1000 + Math.random() * 9000).toString()));
+    }
+    initPeer(Math.floor(1000 + Math.random() * 9000).toString());
+
+    function startHost() {
+        isHost = true;
+        generateWalls();
+        document.getElementById('host-id-display').innerText = peer.id;
+        peer.on('connection', (c) => { 
+            conn = c; 
+            setupConn(); 
+        });
+    }
+
+    function startJoin() {
+        const id = document.getElementById('join-id').value;
+        if(!id) return;
+        conn = peer.connect(id);
+        setupConn();
+    }
+
+    function generateWalls() {
+        obstacles = [];
+        for(let i=0; i<6; i++) {
+            obstacles.push({ x: 400 + Math.random()*400, y: 100 + Math.random()*300, w: 30, h: 180 });
+        }
+    }
+
+    function setupConn() {
+        conn.on('open', () => {
+            document.getElementById('conn-stat').innerText = "CONNECTED";
+            if(isHost) conn.send({ type: 'sync-map', obstacles: obstacles });
+            startCore();
+        });
+        conn.on('data', (data) => {
+            const op = isHost ? 'p2' : 'p1';
+            if (data.type === 'sync-map') { obstacles = data.obstacles; startCore(); }
+            if (data.type === 'update') {
+                players[op].x = data.x; players[op].y = data.y; players[op].angle = data.angle;
+                if (data.shot) players[op].bullets.push({x: data.x, y: data.y, vx: Math.cos(data.angle)*25, vy: Math.sin(data.angle)*25});
+            }
+            if (data.type === 'hit') { players[op].hp = data.hp; }
+            if (data.type === 'restart-trigger') { performReset(data.newWalls); }
+        });
+        conn.on('close', () => location.reload());
+    }
+
+    function startCore() {
+        document.getElementById('menu').style.display = 'none';
+        document.getElementById('game-over').style.display = 'none';
+        document.getElementById('leave-btn').style.display = 'block';
+        document.querySelectorAll('.joystick-container').forEach(j => j.style.display = 'block');
+        if(!gameRunning) {
+            gameRunning = true;
+            loop();
+        }
+    }
+
+    function hostRequestReset() {
+        if(!isHost) return;
+        generateWalls();
+        conn.send({ type: 'restart-trigger', newWalls: obstacles });
+        performReset(obstacles);
+    }
+
+    function performReset(newWalls) {
+        obstacles = newWalls;
+        players.p1 = { x: 150, y: 350, angle: 0, color: '#e74c3c', bullets: [], hp: 10 };
+        players.p2 = { x: 1050, y: 350, angle: Math.PI, color: '#3498db', bullets: [], hp: 10 };
+        document.getElementById('game-over').style.display = 'none';
+        gameRunning = true;
+    }
+
+    // Input Handling
+    const move = { x: 0, y: 0 }, fire = { x: 0, y: 0, active: false };
+    function stick(id, obj) {
+        const c = document.getElementById(id), s = c.querySelector('.stick');
+        c.addEventListener('touchstart', (e) => e.preventDefault());
+        window.addEventListener('touchmove', (e) => {
+            const t = Array.from(e.touches).find(v => v.target.closest('#' + id));
+            if (!t) return;
+            const r = c.getBoundingClientRect(), dx = t.clientX - (r.left + 55), dy = t.clientY - (r.top + 55);
+            const d = Math.min(Math.sqrt(dx*dx+dy*dy), 40), a = Math.atan2(dy, dx);
+            obj.x = Math.cos(a)*(d/40); obj.y = Math.sin(a)*(d/40);
+            if(id === 'fire-stick') obj.active = true;
+            s.style.transform = `translate(${Math.cos(a)*d}px, ${Math.sin(a)*d}px)`;
+        });
+        window.addEventListener('touchend', () => { obj.x = 0; obj.y = 0; if(id === 'fire-stick') obj.active = false; s.style.transform = `translate(0,0)`; });
+    }
+    stick('move-stick', move); stick('fire-stick', fire);
+
+    function loop() {
+        if (!gameRunning) { requestAnimationFrame(loop); return; }
+        const me = players[isHost ? 'p1' : 'p2'], op = players[isHost ? 'p2' : 'p1'];
+
+        // Move
+        let nx = me.x + move.x*8, ny = me.y + move.y*8;
+        let ok = nx > 30 && nx < GAME_W-30 && ny > 30 && ny < GAME_H-30;
+        obstacles.forEach(o => { if(nx > o.x-20 && nx < o.x+o.w+20 && ny > o.y-20 && ny < o.y+o.h+20) ok = false; });
+        if(ok) { me.x = nx; me.y = ny; }
+
+        // Fire
+        let shot = false;
+        if (fire.active && Date.now() - lastFire > 250) {
+            me.angle = Math.atan2(fire.y, fire.x);
+            me.bullets.push({x: me.x, y: me.y, vx: Math.cos(me.angle)*25, vy: Math.sin(me.angle)*25});
+            lastFire = Date.now(); shot = true;
+        }
+        if(conn && conn.open) conn.send({ type: 'update', x: me.x, y: me.y, angle: me.angle, shot: shot });
+
+        // Bullets
+        [me, op].forEach(p => {
+            p.bullets.forEach((b, i) => {
+                b.x += b.vx; b.y += b.vy;
+                obstacles.forEach(o => { if(b.x > o.x && b.x < o.x+o.w && b.y > o.y && b.y < o.y+o.h) p.bullets.splice(i, 1); });
+                if (p === op && Math.hypot(b.x-me.x, b.y-me.y) < 25) {
+                    p.bullets.splice(i, 1);
+                    me.hp--;
+                    conn.send({ type: 'hit', hp: me.hp });
+                    if(me.hp <= 0) triggerEnd("WASTED");
+                }
+                if (b.x < 0 || b.x > GAME_W || b.y < 0 || b.y > GAME_H) p.bullets.splice(i, 1);
+            });
+        });
+
+        if(op.hp <= 0) triggerEnd("VICTORY");
+
+        // Draw
+        ctx.fillStyle = "#111"; ctx.fillRect(0, 0, GAME_W, GAME_H);
+        obstacles.forEach(o => { ctx.fillStyle = "#333"; ctx.fillRect(o.x, o.y, o.w, o.h); });
+        [me, op].forEach(p => {
+            if(p.hp <= 0) return;
+            ctx.fillStyle = "#222"; ctx.fillRect(p.x-30, p.y-45, 60, 6);
+            ctx.fillStyle = p.color; ctx.fillRect(p.x-30, p.y-45, (p.hp/10)*60, 6);
+            ctx.save(); ctx.translate(p.x, p.y); ctx.rotate(p.angle);
+            ctx.fillStyle = p.color; ctx.fillRect(-20,-20,40,40);
+            ctx.fillStyle = "black"; ctx.fillRect(5,-5,25,10); ctx.restore();
+            p.bullets.forEach(b => { ctx.fillStyle = "yellow"; ctx.beginPath(); ctx.arc(b.x, b.y, 4, 0, 7); ctx.fill(); });
+        });
+        requestAnimationFrame(loop);
+    }
+
+    function triggerEnd(msg) {
+        gameRunning = false;
+        document.getElementById('game-over').style.display = 'block';
+        document.getElementById('result-text').innerText = msg;
+        document.getElementById('restart-btn').style.display = isHost ? 'block' : 'none';
+        document.getElementById('wait-msg').style.display = isHost ? 'none' : 'block';
+    }
+</script>
+</body>
+</html>
